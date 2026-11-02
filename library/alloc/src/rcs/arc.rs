@@ -7,7 +7,7 @@ use core::cmp::Ordering;
 use core::hash::{Hash, Hasher};
 use core::marker::{PhantomData, Unsize};
 use core::mem::{self, Alignment, ManuallyDrop};
-use core::num::NonZeroUsize;
+use core::num::{NonZero, NonZeroUsize};
 use core::ops::{CoerceUnsized, Deref, DerefMut, DerefPure, DispatchFromDyn, LegacyReceiver};
 #[cfg(not(no_global_oom_handling))]
 use core::ops::{Residual, Try};
@@ -481,13 +481,13 @@ impl<T> Arc<T> {
     #[cfg(not(no_global_oom_handling))]
     #[inline]
     #[unstable(feature = "arc_n", issue = "none")]
-    pub fn new_n(data: T, n: usize) -> ArcIter<T> {
+    pub fn new_n(data: T, n: usize) -> ArcClones<T> {
         if n > MAX_REFCOUNT {
             panic_arc_overflow();
         }
-        if n == 0 {
-            return ArcIter::default();
-        }
+        let Some(remaining) = NonZero::new(n) else {
+            return ArcClones::default();
+        };
         let inner = Box::new(ArcInner {
             strong: atomic::AtomicUsize::new(n),
             weak: atomic::AtomicUsize::new(1),
@@ -495,7 +495,7 @@ impl<T> Arc<T> {
         });
         // SAFETY: Pointer is valid.
         let arc = unsafe { Self::from_inner(Box::into_non_null(inner)) };
-        ArcIter { arc: Some(arc), remaining: n }
+        ArcClones { arc_remaining: Some((arc, remaining)) }
     }
 
     /// Constructs a new `Arc<T>` while giving you a `Weak<T>` to the allocation,
@@ -1711,7 +1711,7 @@ impl<T: ?Sized> Arc<T> {
     /// exceeding of isize::MAX.
     #[inline]
     #[unstable(feature = "arc_n", issue = "none")]
-    pub fn clone_n(this: &Self, n: usize) -> ArcIter<T> {
+    pub fn clone_n(this: &Self, n: usize) -> ArcClones<T> {
         // The maximum increment `n` allowed in a single `clone_n(n)` call.
         // Capped at 2^32 on 64-bit, or `1 << (usize::BITS / 2)` on smaller targets.
         // - 64-bit: 2^32 (4,294,967,296) -> leaves room for 2^31 concurrent max-n calls
@@ -1725,9 +1725,9 @@ impl<T: ?Sized> Arc<T> {
         // system.
         const MAX_CLONE_N: usize = if usize::BITS > 16 { 1usize << (usize::BITS / 2) } else { 0 };
 
-        if n == 0 {
-            return ArcIter::default();
-        }
+        let Some(remaining) = NonZero::new(n) else {
+            return ArcClones::default();
+        };
         if n > MAX_REFCOUNT {
             panic_arc_overflow();
         }
@@ -1749,7 +1749,7 @@ impl<T: ?Sized> Arc<T> {
         }
         // SAFETY: Pointer is valid.
         let arc = unsafe { Self::from_inner(this.ptr) };
-        ArcIter { arc: Some(arc), remaining: n }
+        ArcClones { arc_remaining: Some((arc, remaining)) }
     }
 
     /// Constructs an `Arc<T>` from a raw pointer.
@@ -5335,23 +5335,19 @@ unsafe impl<T: Allocator + ?Sized, A: AllocatorClone> AllocatorClone for Arc<T, 
 ///
 /// Upon drop any remaining references are released.
 #[unstable(feature = "arc_n", issue = "none")]
-pub struct ArcIter<T: ?Sized> {
-    /// This is the last reference that's handed out (when remaining == 1). It's also the reference
-    /// that when dropped triggers the final release of the underlying memory if it was the last
-    /// reference.
-    arc: Option<Arc<T>>,
-    /// The reference counter representing how many references were allocated in bulk (i.e. the
-    /// atomic counter) has at least this many.
-    remaining: usize,
+pub struct ArcClones<T: ?Sized> {
+    /// This is an owned reference that's being handed out + the number of references that have
+    /// been acquired in the batch operations (including the Arc<T>).
+    arc_remaining: Option<(Arc<T>, NonZero<usize>)>,
 }
 
 #[unstable(feature = "arc_n", issue = "none")]
-impl<T: ?Sized + fmt::Debug> fmt::Debug for ArcIter<T> {
+impl<T: ?Sized + fmt::Debug> fmt::Debug for ArcClones<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut fmt = f.debug_struct("ArcIter");
-        fmt.field("remaining", &self.remaining);
+        let mut fmt = f.debug_struct("ArcClones");
+        fmt.field("remaining", &self.len());
 
-        if let Some(arc) = self.arc.as_ref() {
+        if let Some((arc, _)) = self.arc_remaining.as_ref() {
             fmt.field("value", arc);
         } else {
             fmt.field("value", &"<exhausted>");
@@ -5362,19 +5358,19 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ArcIter<T> {
 }
 
 #[unstable(feature = "arc_n", issue = "none")]
-impl<T: ?Sized> Default for ArcIter<T> {
+impl<T: ?Sized> Default for ArcClones<T> {
     #[inline]
     fn default() -> Self {
-        Self { arc: None, remaining: 0 }
+        Self { arc_remaining: None }
     }
 }
 
 #[unstable(feature = "arc_n", issue = "none")]
-impl<T: ?Sized> Clone for ArcIter<T> {
+impl<T: ?Sized> Clone for ArcClones<T> {
     #[inline]
     fn clone(&self) -> Self {
-        if let Some(arc) = self.arc.as_ref() {
-            Arc::clone_n(arc, self.remaining)
+        if let Some((arc, remaining)) = self.arc_remaining.as_ref() {
+            Arc::clone_n(arc, remaining.get())
         } else {
             Self::default()
         }
@@ -5382,60 +5378,58 @@ impl<T: ?Sized> Clone for ArcIter<T> {
 }
 
 #[unstable(feature = "arc_n", issue = "none")]
-impl<T: ?Sized> Iterator for ArcIter<T> {
+impl<T: ?Sized> Iterator for ArcClones<T> {
     type Item = Arc<T>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        let Some(arc) = self.arc.as_ref() else {
-            debug_assert!(
-                self.remaining == 0,
-                "Can't have any remaining references unaccounted for here"
-            );
-            return None;
-        };
-        debug_assert!(
-            self.remaining >= 1,
-            "We have to have at least 1 reference if we have an Arc in the iterator"
-        );
-        self.remaining -= 1;
-        if self.remaining == 0 {
-            debug_assert!(self.arc.is_some(), "We already checked Arc is_some above");
-            self.arc.take()
-        } else {
+        let (arc, remaining) = self.arc_remaining.as_mut()?;
+        if let Some(new_remaining) = NonZero::new(remaining.get() - 1) {
+            *remaining = new_remaining;
             // This reference count has already been accounted for so we can cheaply construct the
             // Arc wrapper.
             // SAFETY: We still have > 1 clones already accounted for so we can just construct the
             // Arc clone.
             Some(unsafe { Arc::from_inner(arc.ptr) })
+        } else {
+            self.arc_remaining.take().map(|(arc, _)| arc)
         }
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
+        let remaining = self.arc_remaining.as_ref().map_or(0, |(_, remaining)| remaining.get());
+        (remaining, Some(remaining))
     }
 
     #[inline]
     fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
-        let advanced = n.min(self.remaining);
-        if advanced == self.remaining {
+        let Some((arc, remaining)) = self.arc_remaining.as_mut() else {
+            return NonZero::new(n).map_or(Ok(()), Err);
+        };
+        let len = remaining.get();
+        if let Some(new_remaining) = NonZero::new(len.saturating_sub(n)) {
+            if n > 0 {
+                // Bulk-release the `n` skipped references in a single atomic operation.
+                // SAFETY: `n < remaining.get()`, so at least 1 reference remains in `arc_remaining`.
+                // SAFETY: Relaxed ordering is correct because the value is guaranteed to not be
+                // destroyed before we drop the Arc.
+                arc.inner().strong.fetch_sub(n, Relaxed);
+                *remaining = new_remaining;
+            }
+            Ok(())
+        } else {
             drop(mem::take(self));
-        } else if advanced > 0 {
-            // Bulk-release the `n` skipped references in a single atomic operation.
-            // SAFETY: `n < self.remaining`, so at least 1 reference remains in `self.arc`.
-            self.arc.as_ref().unwrap().inner().strong.fetch_sub(advanced, Release);
-            self.remaining -= advanced;
+            NonZero::new(n - len).map_or(Ok(()), Err)
         }
-        NonZeroUsize::new(n - advanced).map_or(Ok(()), Err)
     }
 }
 
 #[unstable(feature = "arc_n", issue = "none")]
-impl<T: ?Sized> ExactSizeIterator for ArcIter<T> {}
+impl<T: ?Sized> ExactSizeIterator for ArcClones<T> {}
 
 #[unstable(feature = "arc_n", issue = "none")]
-impl<T: ?Sized> iter::DoubleEndedIterator for ArcIter<T> {
+impl<T: ?Sized> iter::DoubleEndedIterator for ArcClones<T> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         self.next()
@@ -5449,26 +5443,25 @@ impl<T: ?Sized> iter::DoubleEndedIterator for ArcIter<T> {
 
 // SAFETY: We only deal in `usize` and the len is always perfect.
 #[unstable(feature = "arc_n", issue = "none")]
-impl<T: ?Sized> iter::FusedIterator for ArcIter<T> {}
+impl<T: ?Sized> iter::FusedIterator for ArcClones<T> {}
 
 #[unstable(feature = "trusted_len", issue = "37572")]
-unsafe impl<T: ?Sized> iter::TrustedLen for ArcIter<T> {}
+unsafe impl<T: ?Sized> iter::TrustedLen for ArcClones<T> {}
 
 #[unstable(feature = "arc_n", issue = "none")]
-impl<T: ?Sized> Drop for ArcIter<T> {
+impl<T: ?Sized> Drop for ArcClones<T> {
     fn drop(&mut self) {
-        if self.remaining > 1 {
+        if let Some((arc, remaining)) = self.arc_remaining.as_ref()
+            && remaining.get() > 1
+        {
             // We drop all the remaining "non-owned" references from the counter, that's why it's -1.
-            // The last in "remaining" is stored in self.arc which results in it's own decrement and
-            // finally dropping the underlying memory. Technically this results in 2 atomic
+            // The last in "remaining" is stored in self.arc_remaining which results in it's own
+            // decrement and finally dropping the underlying memory. Technically this results in 2 atomic
             // decrements instead of 1 but it's a small unlikely penalty as the expectation is that
             // all values are consumed from the iterator.
-            self.arc.as_ref().unwrap().inner().strong.fetch_sub(self.remaining - 1, Release);
-        } else {
-            debug_assert!(
-                (self.remaining == 0 && self.arc.is_none())
-                    || (self.remaining == 1 && self.arc.is_some())
-            );
+            // SAFETY: Relaxed ordering is sufficient here because we guarantee that the Arc
+            // reference is still alive, hence the - 1.
+            arc.inner().strong.fetch_sub(remaining.get() - 1, Relaxed);
         }
     }
 }

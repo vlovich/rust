@@ -2,7 +2,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::iter::TrustedLen;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, ArcIter, UniqueArc, Weak};
+use std::sync::{Arc, ArcClones, UniqueArc, Weak};
 
 struct ArcNDrop<'a>(&'a Cell<usize>);
 
@@ -393,6 +393,21 @@ fn n_iter_clone_unsized_outlives_source() {
 }
 
 #[test]
+fn n_iter_debug() {
+    let original = Arc::new(42);
+    let mut iter = Arc::clone_n(&original, 3);
+    assert_eq!(format!("{iter:?}"), "ArcClones { remaining: 3, value: 42 }");
+    assert_eq!(Arc::strong_count(&original), 4);
+    drop(iter.next().unwrap());
+    assert_eq!(format!("{iter:?}"), "ArcClones { remaining: 2, value: 42 }");
+    assert_eq!(Arc::strong_count(&original), 3);
+    iter.advance_back_by(2).unwrap();
+    assert_eq!(format!("{iter:?}"), "ArcClones { remaining: 0, value: \"<exhausted>\" }");
+    assert_eq!(Arc::strong_count(&original), 1);
+    assert_eq!(format!("{:?}", ArcClones::<i32>::default()), format!("{iter:?}"));
+}
+
+#[test]
 fn n_iter_default() {
     fn check<I: DoubleEndedIterator + ExactSizeIterator + std::iter::FusedIterator + TrustedLen>(
         mut iter: I,
@@ -414,7 +429,7 @@ fn n_iter_default() {
     let drops = Cell::new(0);
     let mut iter = Arc::new_n(ArcNDrop(&drops), 3);
     let first = iter.next().unwrap();
-    let empty = ArcIter::<ArcNDrop<'_>>::default();
+    let empty = ArcClones::<ArcNDrop<'_>>::default();
     check(empty.clone());
     check(empty);
     assert_eq!(Arc::strong_count(&first), 3);
@@ -426,8 +441,8 @@ fn n_iter_default() {
 
     let original: Arc<[i32]> = Arc::from([1, 2, 3]);
     let iter = Arc::clone_n(&original, 2);
-    check(ArcIter::<[i32]>::default());
-    check(ArcIter::<[ArcNDrop<'_>]>::default());
+    check(ArcClones::<[i32]>::default());
+    check(ArcClones::<[ArcNDrop<'_>]>::default());
     assert_eq!(Arc::strong_count(&original), 3);
     drop(iter);
     assert_eq!(Arc::strong_count(&original), 1);
